@@ -439,6 +439,9 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
                 document.getElementById('settingsCard').style.display='block';
                 loadSettings();
             }
+            if(tab==='traffic'){
+                renderTraffic();
+            }
             load();
         }
         

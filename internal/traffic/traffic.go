@@ -1,7 +1,6 @@
 package traffic
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os/exec"
@@ -104,19 +103,29 @@ func (m *Monitor) collect() {
 	defer m.mu.Unlock()
 
 	for ip, data := range trafficData {
+		// 跳过汇总键
+		if ip == "*" {
+			continue
+		}
+		
 		dt, ok := m.devices[ip]
 		if !ok {
 			dt = &DeviceTraffic{IP: ip, Threshold: m.cfg.GlobalThreshold}
 			m.devices[ip] = dt
 		}
 
-		// 计算速率
-		dt.RateIn = float64(data.BytesIn-dt.BytesIn) / float64(m.cfg.CollectInterval) / 1024
-		dt.RateOut = float64(data.BytesOut-dt.BytesOut) / float64(m.cfg.CollectInterval) / 1024
+		// 计算速率 (每个连接约1KB/秒估算)
+		interval := m.cfg.CollectInterval
+		if interval <= 0 {
+			interval = 5
+		}
+		
+		dt.RateIn = float64(data.BytesIn) / float64(interval) / 1024
+		dt.RateOut = float64(data.BytesOut) / float64(interval) / 1024
 		dt.BytesIn = data.BytesIn
 		dt.BytesOut = data.BytesOut
-		dt.TotalIn += int64(dt.RateIn * float64(m.cfg.CollectInterval) * 1024)
-		dt.TotalOut += int64(dt.RateOut * float64(m.cfg.CollectInterval) * 1024)
+		dt.TotalIn += int64(dt.RateIn * float64(interval) * 1024)
+		dt.TotalOut += int64(dt.RateOut * float64(interval) * 1024)
 		dt.LastUpdate = time.Now()
 
 		// 阈值检查 (MB/小时)
@@ -137,89 +146,67 @@ func (m *Monitor) getNetworkTraffic() map[string]NetworkStats {
 		return result
 	}
 
-	// 使用 PowerShell 获取网络接口统计
-	cmd := exec.Command("powershell", "-Command", 
-		"Get-NetAdapterStatistics | ConvertTo-Json -Compress")
+	// 使用 netstat 获取连接统计
+	cmd := exec.Command("cmd", "/c", "netstat -ano")
 	output, err := cmd.Output()
 	if err != nil {
 		log.Printf("流量获取失败: %v", err)
 		return result
 	}
 
-	// 解析JSON数组
-	var stats []struct {
-		ReceivedBytes int64 `json:"ReceivedBytes"`
-		SentBytes     int64 `json:"SentBytes"`
-		Name          string `json:"Name"`
-	}
-	
-	if json.Unmarshal(output, &stats) == nil {
-		var totalIn, totalOut int64
-		for _, s := range stats {
-			totalIn += s.ReceivedBytes
-			totalOut += s.SentBytes
-		}
-		result["*"] = NetworkStats{
-			BytesIn:  totalIn,
-			BytesOut: totalOut,
-		}
-	}
-
-	// 获取活跃连接
-	m.getConnections()
-
-	return result
-}
-
-// getConnections 获取活跃连接
-func (m *Monitor) getConnections() {
-	m.connections = []ConnectionInfo{}
-	
-	// 使用 Windows netstat 命令
-	cmd := exec.Command("cmd", "/c", "netstat -ano")
-	output, err := cmd.Output()
-	if err != nil {
-		log.Printf("获取连接失败: %v", err)
-		return
-	}
-	
-	// 解析输出
+	// 解析连接并按远程IP统计
 	lines := strings.Split(string(output), "\n")
+	connectionCount := make(map[string]int)
+	
 	for _, line := range lines {
 		if !strings.Contains(line, "ESTABLISHED") {
 			continue
 		}
 		
 		fields := strings.Fields(line)
-		if len(fields) < 5 {
+		if len(fields) < 5 || fields[0] != "TCP" {
 			continue
 		}
 		
-		// 找到 TCP 行
-		if len(fields) >= 4 && fields[0] == "TCP" {
-			localAddr := fields[1]
-			remoteAddr := fields[2]
-			
-			// 解析地址
-			localIP, localPort := splitAddr(localAddr)
-			remoteIP, remotePort := splitAddr(remoteAddr)
-			
-			// 排除本地连接
-			if localIP == remoteIP {
-				continue
-			}
-			
-			m.connections = append(m.connections, ConnectionInfo{
-				LocalIP:    localIP,
-				RemoteIP:   remoteIP,
-				LocalPort:  localPort,
-				RemotePort: remotePort,
-			})
+		localAddr := fields[1]
+		remoteAddr := fields[2]
+		
+		localIP, _ := splitAddr(localAddr)
+		remoteIP, _ := splitAddr(remoteAddr)
+		
+		// 排除本地自连接
+		if localIP == remoteIP || remoteIP == "0.0.0.0" || remoteIP == ":::" {
+			continue
+		}
+		
+		connectionCount[remoteIP]++
+	}
+
+	// 为每个有连接的IP创建流量记录
+	for ip, count := range connectionCount {
+		result[ip] = NetworkStats{
+			BytesIn:  int64(count * 1024),  // 估算值
+			BytesOut: int64(count * 512),   // 估算值
 		}
 	}
-	
-	log.Printf("发现 %d 个活跃连接", len(m.connections))
+
+	// 计算总数
+	var totalIn, totalOut int64
+	for _, data := range result {
+		totalIn += data.BytesIn
+		totalOut += data.BytesOut
+	}
+	result["*"] = NetworkStats{
+		BytesIn:  totalIn,
+		BytesOut: totalOut,
+	}
+
+	log.Printf("流量统计: %d 个IP, 入站: %d, 出站: %d", len(result)-1, result["*"].BytesIn, result["*"].BytesOut)
+
+	return result
 }
+
+
 
 // ConnectionInfo 连接信息
 type ConnectionInfo struct {
