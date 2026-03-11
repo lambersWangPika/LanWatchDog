@@ -6,6 +6,7 @@ import (
 	"log"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,18 @@ func New(cfg *Config) *Monitor {
 	return m
 }
 
+// splitAddr 分割地址和端口
+func splitAddr(addr string) (string, int) {
+	parts := strings.Split(addr, ":")
+	if len(parts) >= 2 {
+		port := 0
+		fmt.Sscanf(parts[len(parts)-1], "%d", &port)
+		ip := strings.Join(parts[:len(parts)-1], ":")
+		return ip, port
+	}
+	return addr, 0
+}
+
 // Start 启动监控
 func (m *Monitor) Start() {
 	go m.collectLoop()
@@ -65,7 +78,12 @@ func (m *Monitor) Stop() {
 
 // 采集循环
 func (m *Monitor) collectLoop() {
-	ticker := time.NewTicker(time.Duration(m.cfg.CollectInterval) * time.Second)
+	// 设置默认采集间隔
+	interval := m.cfg.CollectInterval
+	if interval <= 0 {
+		interval = 5 // 默认 5 秒
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -157,80 +175,50 @@ func (m *Monitor) getNetworkTraffic() map[string]NetworkStats {
 func (m *Monitor) getConnections() {
 	m.connections = []ConnectionInfo{}
 	
-	// 使用更简单的命令
-	cmd := exec.Command("powershell", "-Command", 
-		"Get-NetTCPConnection -State Established | Select-Object -Property LocalAddress,LocalPort,RemoteAddress,RemotePort | ConvertTo-Json")
+	// 使用 Windows netstat 命令
+	cmd := exec.Command("cmd", "/c", "netstat -ano")
 	output, err := cmd.Output()
 	if err != nil {
 		log.Printf("获取连接失败: %v", err)
 		return
 	}
 	
-	// 解析JSON
-	var data interface{}
-	if json.Unmarshal(output, &data) != nil {
-		log.Printf("JSON解析失败")
-		return
-	}
-	
-	// 处理数组
-	var conns []map[string]interface{}
-	switch v := data.(type) {
-	case []interface{}:
-		for _, item := range v {
-			if c, ok := item.(map[string]interface{}); ok {
-				conns = append(conns, c)
-			}
+	// 解析输出
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if !strings.Contains(line, "ESTABLISHED") {
+			continue
 		}
-	case map[string]interface{}:
-		conns = append(conns, v)
-	}
-	
-	for _, c := range conns {
-		localAddr, _ := c["LocalAddress"].(string)
-		remoteAddr, _ := c["RemoteAddress"].(string)
 		
-		// 显示所有非本地连接
-		if localAddr != "127.0.0.1" && remoteAddr != "127.0.0.1" {
-			localPort := 0
-			remotePort := 0
-			if lp, ok := c["LocalPort"].(float64); ok {
-				localPort = int(lp)
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		
+		// 找到 TCP 行
+		if len(fields) >= 4 && fields[0] == "TCP" {
+			localAddr := fields[1]
+			remoteAddr := fields[2]
+			
+			// 解析地址
+			localIP, localPort := splitAddr(localAddr)
+			remoteIP, remotePort := splitAddr(remoteAddr)
+			
+			// 排除本地连接
+			if localIP == remoteIP {
+				continue
 			}
-			if rp, ok := c["RemotePort"].(float64); ok {
-				remotePort = int(rp)
-			}
+			
 			m.connections = append(m.connections, ConnectionInfo{
-				LocalIP:    localAddr,
-				RemoteIP:   remoteAddr,
+				LocalIP:    localIP,
+				RemoteIP:   remoteIP,
 				LocalPort:  localPort,
 				RemotePort: remotePort,
 			})
 		}
 	}
 	
-	// 去重：按 LocalIP+RemoteIP+LocalPort+RemotePort 去重
-	seen := make(map[string]bool)
-	uniqueConnections := []ConnectionInfo{}
-	for _, conn := range m.connections {
-		key := fmt.Sprintf("%s:%d->%s:%d", conn.LocalIP, conn.LocalPort, conn.RemoteIP, conn.RemotePort)
-		if !seen[key] {
-			seen[key] = true
-			uniqueConnections = append(uniqueConnections, conn)
-		}
-	}
-	
-	// 过滤掉本地自连接（同一个IP的连接，如 192.168.2.216 -> 192.168.2.216）
-	filteredConnections := []ConnectionInfo{}
-	for _, conn := range uniqueConnections {
-		if conn.LocalIP == conn.RemoteIP {
-			continue  // 跳过本地自连接
-		}
-		filteredConnections = append(filteredConnections, conn)
-	}
-	m.connections = filteredConnections
-	
-	log.Printf("发现 %d 个活跃连接 (去重后，排除本地自连接)", len(m.connections))
+	log.Printf("发现 %d 个活跃连接", len(m.connections))
 }
 
 // ConnectionInfo 连接信息
