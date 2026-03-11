@@ -1,0 +1,188 @@
+package main
+
+import (
+	"encoding/json"
+	"html/template"
+	"log"
+	"net/http"
+	"os/exec"
+	"runtime"
+	"time"
+
+	"network-monitor/internal/config"
+	"network-monitor/internal/scanner"
+)
+
+var cfg *config.Config
+var scan *scanner.Scanner
+
+func main() {
+	var err error
+	cfg, err = config.Load("config.json")
+	if err != nil {
+		cfg = config.Default()
+	}
+
+	// 强制设置正确的扫描网段
+	cfg.IPRanges = []string{"192.168.2.0/24", "10.32.32.0/24"}
+	cfg.ScanInterval = 5
+	cfg.ScanTimeout = 1
+	cfg.PingCount = 1
+
+	log.Printf("扫描网段: %v", cfg.IPRanges)
+
+	scan = scanner.New(cfg)
+
+	// 自动打开浏览器
+	go func() {
+		time.Sleep(1 * time.Second)
+		openBrowser("http://localhost:8080")
+	}()
+
+	http.HandleFunc("/", mainPage)
+	http.HandleFunc("/api/scan", apiScan)
+	http.HandleFunc("/api/devices", apiDevices)
+	http.HandleFunc("/api/config", apiConfig)
+
+	log.Println("========================================")
+	log.Println("  局域网设备监控系统 v1.0.0")
+	log.Printf("  扫描范围: %v", cfg.IPRanges)
+	log.Println("  请访问: http://localhost:8080")
+	log.Println("========================================")
+
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func openBrowser(url string) {
+	var args []string
+	switch runtime.GOOS {
+	case "windows":
+		args = []string{"cmd", "/c", "start", url}
+	case "darwin":
+		args = []string{"open", url}
+	default:
+		args = []string{"xdg-open", url}
+	}
+	exec.Command(args[0], args[1:]...).Start()
+}
+
+var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>局域网设备监控系统</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5}
+        .header{background:linear-gradient(135deg,#1890ff 0%,#096dd9 100%);color:white;padding:20px 24px;display:flex;justify-content:space-between;align-items:center}
+        .header h1{font-size:22px}
+        .toolbar{background:white;padding:16px 24px;border-bottom:1px solid #e8e8e8;display:flex;gap:12px}
+        .btn{padding:8px 20px;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:500}
+        .btn-primary{background:#1890ff;color:white}
+        .btn-default{background:#f5f5f5;color:#333;border:1px solid #d9d9d9}
+        .content{padding:24px}
+        .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+        .stat-card{background:white;padding:20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}
+        .stat-card .label{color:#666;font-size:14px}
+        .stat-card .value{font-size:28px;font-weight:600}
+        .card{background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}
+        .card-header{padding:16px 24px;border-bottom:1px solid #e8e8e8;font-weight:600}
+        table{width:100%;border-collapse:collapse}
+        th,td{padding:14px 16px;text-align:left;border-bottom:1px solid #f0f0f0}
+        th{background:#fafafa;font-weight:600}
+        .status{padding:2px 8px;border-radius:4px;font-size:12px}
+        .status-online{background:#f6ffed;color:#52c41a}
+        .status-offline{background:#fff1f0;color:#ff4d4f}
+        .footer{padding:16px 24px;border-top:1px solid #e8e8e8;color:#666;background:white}
+        .empty{text-align:center;color:#999;padding:60px}
+        .log-area{background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.08);margin-top:24px;padding:16px;max-height:200px;overflow:auto}
+        .log-title{font-weight:600;margin-bottom:12px}
+        .log-item{font-family:monospace;font-size:12px;color:#666;padding:2px 0}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🏠 局域网设备监控系统</h1>
+        <span>v1.0.0</span>
+    </div>
+    <div class="toolbar">
+        <button class="btn btn-primary" onclick="scan()" id="scanBtn">🔍 开始扫描</button>
+        <button class="btn btn-default" onclick="load()">🔄 刷新</button>
+        <button class="btn btn-default" onclick="toggleLog()">📋 日志</button>
+    </div>
+    <div class="content">
+        <div class="stats">
+            <div class="stat-card"><div class="label">设备总数</div><div class="value" id="total">0</div></div>
+            <div class="stat-card"><div class="label">在线</div><div class="value" id="online" style="color:#52c41a">0</div></div>
+            <div class="stat-card"><div class="label">离线</div><div class="value" id="offline" style="color:#ff4d4f">0</div></div>
+            <div class="stat-card"><div class="label">扫描范围</div><div class="value" id="range" style="font-size:14px">-</div></div>
+        </div>
+        <div class="card">
+            <div class="card-header">📱 设备列表 (<span id="count">0</span>个)</div>
+            <table>
+                <thead><tr><th>状态</th><th>IP</th><th>名称</th><th>MAC</th><th>厂商</th><th>类型</th><th>最后在线</th></tr></thead>
+                <tbody id="list"><tr><td colspan="7" class="empty">暂无设备</td></tr></tbody>
+            </table>
+        </div>
+        <div class="log-area" id="logArea" style="display:none">
+            <div class="log-title">📋 运行日志</div>
+            <div id="logs"></div>
+        </div>
+    </div>
+    <div class="footer">🕐 最后扫描: <span id="last">-</span></div>
+    <script>
+        let devices=[];
+        function log(msg){
+            document.getElementById('logs').innerHTML='<div class="log-item">'+new Date().toLocaleTimeString()+' '+msg+'</div>'+document.getElementById('logs').innerHTML;
+        }
+        function toggleLog(){document.getElementById('logArea').style.display=document.getElementById('logArea').style.display==='none'?'block':'none';}
+        function fmt(t){return t?new Date(t).toLocaleString('zh-CN'):'-';}
+        function render(){
+            let on=devices.filter(d=>d.status==='online').length;
+            document.getElementById('total').textContent=devices.length;
+            document.getElementById('online').textContent=on;
+            document.getElementById('offline').textContent=devices.length-on;
+            document.getElementById('count').textContent=devices.length;
+            if(!devices.length){document.getElementById('list').innerHTML='<tr><td colspan="7" class="empty">暂无设备，点击扫描</td></tr>';return;}
+            document.getElementById('list').innerHTML=devices.map(d=>'<tr><td><span class="status '+(d.status==='online'?'status-online':'status-offline')+'">'+(d.status==='online'?'在线':'离线')+'</span></td><td>'+d.ip+'</td><td>'+(d.name||'-')+'</td><td>'+(d.mac||'-')+'</td><td>'+(d.vendor||'-')+'</td><td>'+(d.type||'unknown')+'</td><td>'+fmt(d.lastSeen)+'</td></tr>').join('');
+            document.getElementById('last').textContent=fmt(new Date());
+        }
+        function load(){fetch('/api/devices').then(r=>r.json()).then(d=>{devices=d;render();log('加载:'+devices.length+'个');}).catch(e=>log('错误:'+e));}
+        function scan(){
+            document.getElementById('scanBtn').textContent='⏳ 扫描中...';
+            log('开始扫描...');
+            fetch('/api/scan',{method:'POST'}).then(r=>r.json()).then(d=>{devices=d.devices||[];render();log('扫描完成:'+devices.length+'个');document.getElementById('scanBtn').textContent='🔍 开始扫描';}).catch(e=>{log('错误:'+e);document.getElementById('scanBtn').textContent='🔍 开始扫描';});
+        }
+        fetch('/api/config').then(r=>r.json()).then(c=>{document.getElementById('range').textContent=(c.ip_ranges||[]).join(', ');});
+        log('系统启动');
+        load();
+    </script>
+</body>
+</html>`))
+
+func mainPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	pageTmpl.Execute(w, nil)
+}
+
+func apiScan(w http.ResponseWriter, r *http.Request) {
+	log.Println("开始扫描...")
+	devices, err := scan.Scan()
+	if err != nil {
+		log.Println("扫描错误:", err)
+		json.NewEncoder(w).Encode(map[string]interface{}{"error": err.Error()})
+		return
+	}
+	log.Printf("扫描完成: %d个设备", len(devices))
+	json.NewEncoder(w).Encode(map[string]interface{}{"count": len(devices), "devices": devices})
+}
+
+func apiDevices(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(scan.GetDevices())
+}
+
+func apiConfig(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(cfg)
+}

@@ -1,0 +1,35 @@
+# 编译产物
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+vendor/
+*.test
+coverage.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 临时文件
+*.bak
+*.tmp
+*.log
+
+# 压缩包
+*.zip
+*.7z
+*.tar.gz
+*.gz
+
+# base64 编码文件
+*.b64
+*.base64
+
+# 系统文件
+.DS_Store
+Thumbs.db

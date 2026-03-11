@@ -1,0 +1,216 @@
+package scanner
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"os/exec"
+	"runtime"
+	"sync"
+	"time"
+
+	"network-monitor/internal/config"
+	"network-monitor/internal/models"
+)
+
+type Scanner struct {
+	cfg     *config.Config
+	devices map[string]*models.Device
+	mu      sync.RWMutex
+}
+
+func New(cfg *config.Config) *Scanner {
+	return &Scanner{
+		cfg:     cfg,
+		devices: make(map[string]*models.Device),
+	}
+}
+
+func (s *Scanner) Scan() ([]*models.Device, error) {
+	log.Println("开始网络扫描...")
+
+	ips, err := s.getScanIPs()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("待扫描IP数量: %d", len(ips))
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	devices := make([]*models.Device, 0)
+
+	sem := make(chan struct{}, 50)
+
+	for _, ip := range ips {
+		wg.Add(1)
+		go func(ipStr string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			device := s.scanIP(ipStr)
+			if device != nil && (device.Status == models.StatusOnline || device.Status == models.StatusNew) {
+				mu.Lock()
+				devices = append(devices, device)
+				mu.Unlock()
+			}
+		}(ip)
+	}
+
+	wg.Wait()
+	log.Printf("扫描完成，发现 %d 个在线设备", len(devices))
+
+	// 更新内存
+	s.mu.Lock()
+	for _, d := range devices {
+		if existing, ok := s.devices[d.IP]; ok {
+			d.FirstSeen = existing.FirstSeen
+			d.Whitelist = existing.Whitelist
+			d.Name = existing.Name
+			d.Group = existing.Group
+		} else {
+			d.Status = models.StatusNew
+		}
+		s.devices[d.IP] = d
+	}
+	s.mu.Unlock()
+
+	return devices, nil
+}
+
+func (s *Scanner) getScanIPs() ([]string, error) {
+	var ips []string
+	for _, cidr := range s.cfg.IPRanges {
+		ip, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); s.incIP(ip) {
+			ips = append(ips, ip.String())
+		}
+	}
+	return ips, nil
+}
+
+func (s *Scanner) incIP(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
+// 扫描IP - 使用ping检测
+func (s *Scanner) scanIP(ipStr string) *models.Device {
+	device := &models.Device{
+		IP:        ipStr,
+		FirstSeen: time.Now(),
+		LastSeen:  time.Now(),
+		Status:    models.StatusOffline,
+		Type:      models.DeviceTypeUnknown,
+	}
+
+	// 使用系统ping命令
+	online := s.ping(ipStr)
+	if online {
+		device.Status = models.StatusOnline
+		device.LastSeen = time.Now()
+		device.Type = s.identifyDeviceType(ipStr, device.Vendor)
+	}
+
+	return device
+}
+
+// ping 使用系统ping命令
+func (s *Scanner) ping(ipStr string) bool {
+	count := 1
+	if s.cfg.PingCount > 0 {
+		count = s.cfg.PingCount
+	}
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("ping", "-n", fmt.Sprintf("%d", count), "-w", "500", ipStr)
+	} else {
+		cmd = exec.Command("ping", "-c", fmt.Sprintf("%d", count), "-W", "1", ipStr)
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+
+	// 检查输出中是否包含 TTL
+	outputStr := string(output)
+	if runtime.GOOS == "windows" {
+		return containsString(outputStr, "TTL=") || containsString(outputStr, "ttl=")
+	}
+	return containsString(outputStr, "ttl=") || containsString(outputStr, "TTL=")
+}
+
+func containsString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Scanner) identifyDeviceType(ipStr, vendor string) models.DeviceType {
+	parts := net.ParseIP(ipStr).To4()
+	if parts == nil {
+		return models.DeviceTypeUnknown
+	}
+	lastOctet := parts[3]
+
+	// 常见IP模式识别
+	if lastOctet == 1 {
+		return models.DeviceTypeRouter
+	}
+	if lastOctet == 254 {
+		return models.DeviceTypeRouter
+	}
+
+	// 厂商识别
+	vendorLower := vendor
+	switch {
+	case containsString(vendorLower, "cisco"):
+		return models.DeviceTypeRouter
+	case containsString(vendorLower, "huawei"):
+		return models.DeviceTypeRouter
+	case containsString(vendorLower, "tp-link") || containsString(vendorLower, "tplink"):
+		return models.DeviceTypeRouter
+	case containsString(vendorLower, "netgear"):
+		return models.DeviceTypeRouter
+	case containsString(vendorLower, "dell"):
+		return models.DeviceTypeServer
+	case containsString(vendorLower, "hp"):
+		return models.DeviceTypeServer
+	case containsString(vendorLower, "apple"):
+		return models.DeviceTypePC
+	case containsString(vendorLower, "samsung"):
+		return models.DeviceTypePhone
+	case containsString(vendorLower, "xiaomi"):
+		return models.DeviceTypePhone
+	case containsString(vendorLower, "huawei"):
+		return models.DeviceTypePhone
+	case containsString(vendorLower, "canon"):
+		return models.DeviceTypePrinter
+	case containsString(vendorLower, "epson"):
+		return models.DeviceTypePrinter
+	default:
+		return models.DeviceTypePC
+	}
+}
+
+func (s *Scanner) GetDevices() []*models.Device {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	devices := make([]*models.Device, 0, len(s.devices))
+	for _, d := range s.devices {
+		devices = append(devices, d)
+	}
+	return devices
+}
