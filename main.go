@@ -72,7 +72,7 @@ func main() {
 	
 	trafficMon = traffic.New(&traffic.Config{
 		Enabled:         cfg.TrafficEnabled,
-		CollectInterval: cfg.CollectInterval,
+		CollectInterval: cfg.TrafficInterval,
 		GlobalThreshold: cfg.GlobalThreshold,
 		ThresholdUnit:   cfg.ThresholdUnit,
 	})
@@ -805,6 +805,30 @@ func apiConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		*cfg = newCfg
 		config.Save(cfg, "config.json")
+		
+		// 动态更新各模块配置
+		scan.SetConfig(cfg)
+		trafficMon.SetConfig(&traffic.Config{
+			Enabled:         cfg.TrafficEnabled,
+			CollectInterval: cfg.TrafficInterval,
+			GlobalThreshold: cfg.GlobalThreshold,
+			ThresholdUnit:   cfg.ThresholdUnit,
+		})
+		alertMgr.SetConfig(&alerterPkg.Config{
+			Enabled:         cfg.AlertEnabled,
+			SoundEnabled:    cfg.AlertSoundEnabled,
+			NewDeviceAlert:  cfg.NewDeviceAlert,
+			OfflineAlert:    cfg.OfflineAlert,
+			TrafficAlert:    cfg.TrafficAlert,
+			AttackAlert:     cfg.AttackAlert,
+			NotifyWindows:   cfg.NotifyWindows,
+			NotifyTelegram:  cfg.NotifyTelegram,
+			NotifyWebhook:   cfg.NotifyWebhook,
+			WebhookURL:      cfg.WebhookURL,
+			TelegramBotToken: cfg.TelegramBotToken,
+			TelegramChatID:  cfg.TelegramChatID,
+		})
+		
 		appLogger.LogOperation("config_update", "", "Configuration updated")
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 		return

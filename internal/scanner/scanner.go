@@ -46,6 +46,22 @@ func (s *Scanner) Stop() {
 	close(s.stopAutoScan)
 }
 
+// SetConfig 更新配置
+func (s *Scanner) SetConfig(cfg *config.Config) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+	
+	// 重启自动扫描
+	go func() {
+		s.Stop()
+		s.stopAutoScan = make(chan struct{})
+		if cfg.AutoScanOnStart {
+			go s.autoScanLoop()
+		}
+	}()
+}
+
 // 自动扫描循环
 func (s *Scanner) autoScanLoop() {
 	ticker := time.NewTicker(time.Duration(s.cfg.ScanInterval) * time.Minute)

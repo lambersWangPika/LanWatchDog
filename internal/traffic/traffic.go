@@ -23,9 +23,10 @@ type Monitor struct {
 
 // Config 流量监控配置
 type Config struct {
-	Enabled        bool  `json:"enabled"`
-	CollectInterval int  `json:"collect_interval"` // 秒
-	GlobalThreshold int  `json:"global_threshold"`  // MB/小时
+	Enabled         bool  `json:"enabled"`
+	CollectInterval int   `json:"collect_interval"`  // 秒 - 流量采集间隔
+	TrafficInterval int   `json:"traffic_interval"` // 秒 - 流量刷新间隔
+	GlobalThreshold int   `json:"global_threshold"` // MB/小时
 	ThresholdUnit  string `json:"threshold_unit"`
 }
 
@@ -73,6 +74,22 @@ func (m *Monitor) Start() {
 // Stop 停止监控
 func (m *Monitor) Stop() {
 	close(m.stopChan)
+}
+
+// SetConfig 更新配置
+func (m *Monitor) SetConfig(cfg *Config) {
+	m.mu.Lock()
+	m.cfg = cfg
+	m.mu.Unlock()
+	
+	// 重启流量监控
+	go func() {
+		m.Stop()
+		m.stopChan = make(chan struct{})
+		if cfg.Enabled {
+			go m.collectLoop()
+		}
+	}()
 }
 
 // 采集循环
