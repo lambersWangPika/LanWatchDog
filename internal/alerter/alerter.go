@@ -55,6 +55,11 @@ func (a *Alerter) Stop() {
 	close(a.notifyChan)
 }
 
+// SetConfig 更新配置
+func (a *Alerter) SetConfig(cfg *Config) {
+	a.cfg = cfg
+}
+
 // Alert 发送告警
 func (a *Alerter) Alert(level string, alertType string, ip string, mac string, message string) {
 	if !a.cfg.Enabled {

@@ -43,12 +43,15 @@ type Device struct {
 	MAC             string         `json:"mac"`
 	Vendor          string         `json:"vendor"`
 	Name            string         `json:"name"`
+	Notes           string         `json:"notes"`           // 设备备注
+	Hostname        string         `json:"hostname"`        // 主机名 (NetBIOS)
 	Type            DeviceType     `json:"type"`
 	Status          DeviceStatus   `json:"status"`
 	FirstSeen       time.Time      `json:"first_seen"`
 	LastSeen        time.Time      `json:"last_seen"`
 	OnlineDuration  int64          `json:"online_duration"` // 秒
-	WasOnline       bool           `json:"was_online"`      // 是否曾经上线过
+	OnlineSince     time.Time      `json:"online_since"`   // 本次上线时间
+	WasOnline       bool           `json:"was_online"`     // 是否曾经上线过
 	Group           string         `json:"group"`
 	Whitelist       bool           `json:"whitelist"`
 	AlertEnabled    bool           `json:"alert_enabled"`
