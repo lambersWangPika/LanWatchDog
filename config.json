@@ -1,15 +1,13 @@
 {
-  "scan_interval": 5,
-  "scan_timeout": 1,
-  "ping_count": 1,
-  "ip_ranges": [
-    "192.168.2.0/24"
-  ],
+  "scan_interval": 30,
+  "scan_timeout": 0,
+  "ping_count": 0,
+  "ip_ranges": null,
   "traffic_enabled": true,
-  "collect_interval": 1,
+  "collect_interval": 5,
   "traffic_interval": 5,
   "global_threshold": 100,
-  "threshold_unit": "MB/hour",
+  "threshold_unit": "MB",
   "defense_enabled": true,
   "brute_force_detect": true,
   "port_scan_detect": true,
@@ -28,6 +26,6 @@
   "telegram_bot_token": "",
   "telegram_chat_id": "",
   "auto_start": false,
-  "minimize_to_tray": true,
+  "minimize_to_tray": false,
   "auto_scan_on_start": true
 }

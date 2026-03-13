@@ -123,3 +123,119 @@ func Save(cfg *Config, path string) error {
 
 	return nil
 }
+
+// MergeConfig 合并配置 - 只更新JSON中存在的字段
+func MergeConfig(original *Config, jsonData []byte) (*Config, error) {
+	var updateMap map[string]interface{}
+	if err := json.Unmarshal(jsonData, &updateMap); err != nil {
+		return nil, err
+	}
+
+	merged := *original
+
+	// 扫描设置
+	if v, ok := updateMap["scan_interval"]; ok {
+		if f, ok := v.(float64); ok { merged.ScanInterval = int(f) }
+	}
+	if v, ok := updateMap["scan_timeout"]; ok {
+		if f, ok := v.(float64); ok { merged.ScanTimeout = int(f) }
+	}
+	if v, ok := updateMap["ping_count"]; ok {
+		if f, ok := v.(float64); ok { merged.PingCount = int(f) }
+	}
+	if v, ok := updateMap["ip_ranges"]; ok {
+		if arr, ok := v.([]interface{}); ok {
+			merged.IPRanges = make([]string, len(arr))
+			for i, item := range arr {
+				if s, ok := item.(string); ok { merged.IPRanges[i] = s }
+			}
+		}
+	}
+
+	// 流量监控
+	if v, ok := updateMap["traffic_enabled"]; ok {
+		if b, ok := v.(bool); ok { merged.TrafficEnabled = b }
+	}
+	if v, ok := updateMap["collect_interval"]; ok {
+		if f, ok := v.(float64); ok { merged.CollectInterval = int(f) }
+	}
+	if v, ok := updateMap["traffic_interval"]; ok {
+		if f, ok := v.(float64); ok { merged.TrafficInterval = int(f) }
+	}
+	if v, ok := updateMap["global_threshold"]; ok {
+		if f, ok := v.(float64); ok { merged.GlobalThreshold = int(f) }
+	}
+	if v, ok := updateMap["threshold_unit"]; ok {
+		if s, ok := v.(string); ok { merged.ThresholdUnit = s }
+	}
+
+	// 防御设置
+	if v, ok := updateMap["defense_enabled"]; ok {
+		if b, ok := v.(bool); ok { merged.DefenseEnabled = b }
+	}
+	if v, ok := updateMap["brute_force_detect"]; ok {
+		if b, ok := v.(bool); ok { merged.BruteForceDetect = b }
+	}
+	if v, ok := updateMap["port_scan_detect"]; ok {
+		if b, ok := v.(bool); ok { merged.PortScanDetect = b }
+	}
+	if v, ok := updateMap["flood_detect"]; ok {
+		if b, ok := v.(bool); ok { merged.FloodDetect = b }
+	}
+	if v, ok := updateMap["arp_spoof_detect"]; ok {
+		if b, ok := v.(bool); ok { merged.ARPSpoofDetect = b }
+	}
+
+	// 告警设置
+	if v, ok := updateMap["alert_enabled"]; ok {
+		if b, ok := v.(bool); ok { merged.AlertEnabled = b }
+	}
+	if v, ok := updateMap["alert_sound_enabled"]; ok {
+		if b, ok := v.(bool); ok { merged.AlertSoundEnabled = b }
+	}
+	if v, ok := updateMap["new_device_alert"]; ok {
+		if b, ok := v.(bool); ok { merged.NewDeviceAlert = b }
+	}
+	if v, ok := updateMap["offline_alert"]; ok {
+		if b, ok := v.(bool); ok { merged.OfflineAlert = b }
+	}
+	if v, ok := updateMap["traffic_alert"]; ok {
+		if b, ok := v.(bool); ok { merged.TrafficAlert = b }
+	}
+	if v, ok := updateMap["attack_alert"]; ok {
+		if b, ok := v.(bool); ok { merged.AttackAlert = b }
+	}
+
+	// 通知设置
+	if v, ok := updateMap["notify_windows"]; ok {
+		if b, ok := v.(bool); ok { merged.NotifyWindows = b }
+	}
+	if v, ok := updateMap["notify_telegram"]; ok {
+		if b, ok := v.(bool); ok { merged.NotifyTelegram = b }
+	}
+	if v, ok := updateMap["notify_webhook"]; ok {
+		if b, ok := v.(bool); ok { merged.NotifyWebhook = b }
+	}
+	if v, ok := updateMap["webhook_url"]; ok {
+		if s, ok := v.(string); ok { merged.WebhookURL = s }
+	}
+	if v, ok := updateMap["telegram_bot_token"]; ok {
+		if s, ok := v.(string); ok { merged.TelegramBotToken = s }
+	}
+	if v, ok := updateMap["telegram_chat_id"]; ok {
+		if s, ok := v.(string); ok { merged.TelegramChatID = s }
+	}
+
+	// 常规设置
+	if v, ok := updateMap["auto_start"]; ok {
+		if b, ok := v.(bool); ok { merged.AutoStart = b }
+	}
+	if v, ok := updateMap["minimize_to_tray"]; ok {
+		if b, ok := v.(bool); ok { merged.MinimizeToTray = b }
+	}
+	if v, ok := updateMap["auto_scan_on_start"]; ok {
+		if b, ok := v.(bool); ok { merged.AutoScanOnStart = b }
+	}
+
+	return &merged, nil
+}

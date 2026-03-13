@@ -5,103 +5,108 @@ import (
 	"log"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"network-monitor/internal/models"
 )
 
 // Monitor 流量监控器
 type Monitor struct {
-	cfg            *Config
-	devices        map[string]*DeviceTraffic
-	connections    []ConnectionInfo
-	mu             sync.RWMutex
-	stopChan       chan struct{}
+	cfg          *Config
+	devices      map[string]*DeviceTraffic
+	connections  []ConnectionInfo
+	mu           sync.RWMutex
+	stopChan     chan struct{}
+	// 记录监控开始时的网卡流量（用于计算增量）
+	startBytesIn   int64
+	startBytesOut int64
+	// 上一次的值（用于计算速率）
+	lastBytesIn   int64
+	lastBytesOut  int64
+	lastUpdate    time.Time
+	// 监控开始后的累计流量
+	totalStats    NetworkStats
+	history       []HistoryPoint
 }
 
-// Config 流量监控配置
+type HistoryPoint struct {
+	Timestamp time.Time
+	RateIn    float64
+	RateOut   float64
+	TotalIn   int64
+	TotalOut  int64
+}
+
 type Config struct {
 	Enabled         bool  `json:"enabled"`
-	CollectInterval int   `json:"collect_interval"`  // 秒 - 流量采集间隔
-	TrafficInterval int   `json:"traffic_interval"` // 秒 - 流量刷新间隔
-	GlobalThreshold int   `json:"global_threshold"` // MB/小时
+	CollectInterval int   `json:"collect_interval"`
+	TrafficInterval int   `json:"traffic_interval"`
+	GlobalThreshold int   `json:"global_threshold"`
 	ThresholdUnit  string `json:"threshold_unit"`
 }
 
-// DeviceTraffic 设备流量数据
 type DeviceTraffic struct {
-	IP            string
-	BytesIn       int64
-	BytesOut      int64
-	RateIn        float64 // KB/s
-	RateOut       float64 // KB/s
-	LastUpdate    time.Time
-	TotalIn       int64
-	TotalOut      int64
-	AlertActive   bool
-	Threshold     int // MB/小时
+	IP          string
+	BytesIn     int64
+	BytesOut    int64
+	RateIn      float64
+	RateOut     float64
+	LastUpdate  time.Time
+	TotalIn     int64
+	TotalOut    int64
+	Threshold   int
+	AlertActive bool
 }
 
-// New 创建流量监控器
+type ConnectionInfo struct {
+	LocalIP   string `json:"local_ip"`
+	RemoteIP  string `json:"remote_ip"`
+	LocalPort int    `json:"local_port"`
+	RemotePort int   `json:"remote_port"`
+}
+
+type NetworkStats struct {
+	BytesIn  int64
+	BytesOut int64
+	RateIn   float64
+	RateOut  float64
+}
+
 func New(cfg *Config) *Monitor {
 	m := &Monitor{
-		cfg:     cfg,
-		devices: make(map[string]*DeviceTraffic),
+		cfg:      cfg,
+		devices:  make(map[string]*DeviceTraffic),
 		stopChan: make(chan struct{}),
 	}
+	if cfg.Enabled {
+		go func() { m.collectLoop() }()
+	}
+	log.Println("[Traffic] 流量监控器已启动")
 	return m
 }
 
-// splitAddr 分割地址和端口
-func splitAddr(addr string) (string, int) {
-	parts := strings.Split(addr, ":")
-	if len(parts) >= 2 {
-		port := 0
-		fmt.Sscanf(parts[len(parts)-1], "%d", &port)
-		ip := strings.Join(parts[:len(parts)-1], ":")
-		return ip, port
-	}
-	return addr, 0
-}
-
-// Start 启动监控
 func (m *Monitor) Start() {
-	go m.collectLoop()
+	if m.cfg.Enabled {
+		go m.collectLoop()
+	}
 }
 
-// Stop 停止监控
 func (m *Monitor) Stop() {
 	close(m.stopChan)
 }
 
-// SetConfig 更新配置
 func (m *Monitor) SetConfig(cfg *Config) {
-	m.mu.Lock()
 	m.cfg = cfg
-	m.mu.Unlock()
-	
-	// 重启流量监控
-	go func() {
-		m.Stop()
-		m.stopChan = make(chan struct{})
-		if cfg.Enabled {
-			go m.collectLoop()
-		}
-	}()
 }
 
-// 采集循环
 func (m *Monitor) collectLoop() {
-	// 设置默认采集间隔
 	interval := m.cfg.CollectInterval
 	if interval <= 0 {
-		interval = 5 // 默认 5 秒
+		interval = 5
 	}
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
@@ -112,145 +117,188 @@ func (m *Monitor) collectLoop() {
 	}
 }
 
-// 采集流量数据
 func (m *Monitor) collect() {
-	trafficData := m.getNetworkTraffic()
+	// 获取全局网卡流量
+	globalData := m.getGlobalTraffic()
 	
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for ip, data := range trafficData {
-		// 跳过汇总键
-		if ip == "*" {
+	now := time.Now()
+	interval := m.cfg.CollectInterval
+	if interval <= 0 {
+		interval = 5
+	}
+
+	// 首次运行时，初始化起始流量
+	if m.startBytesIn == 0 {
+		m.startBytesIn = globalData.BytesIn
+		m.startBytesOut = globalData.BytesOut
+		m.lastBytesIn = globalData.BytesIn
+		m.lastBytesOut = globalData.BytesOut
+		m.lastUpdate = now
+		log.Printf("[Traffic] 流量监控初始化，起始流量: in=%d, out=%d", m.startBytesIn, m.startBytesOut)
+		return
+	}
+
+	timeDiff := now.Sub(m.lastUpdate).Seconds()
+	if timeDiff <= 0 {
+		timeDiff = float64(interval)
+	}
+
+	// 计算全局速率 (bytes/sec → KB/s)
+	if m.lastBytesIn > 0 && globalData.BytesIn >= m.lastBytesIn {
+		deltaIn := globalData.BytesIn - m.lastBytesIn
+		m.totalStats.RateIn = float64(deltaIn) / timeDiff / 1024
+	}
+	if m.lastBytesOut > 0 && globalData.BytesOut >= m.lastBytesOut {
+		deltaOut := globalData.BytesOut - m.lastBytesOut
+		m.totalStats.RateOut = float64(deltaOut) / timeDiff / 1024
+	}
+
+	// 累计流量 = 监控开始后的增量 (当前值 - 起始值)
+	m.totalStats.BytesIn = globalData.BytesIn - m.startBytesIn
+	m.totalStats.BytesOut = globalData.BytesOut - m.startBytesOut
+
+	m.lastBytesIn = globalData.BytesIn
+	m.lastBytesOut = globalData.BytesOut
+	m.lastUpdate = now
+
+	// 获取连接统计
+	connections := m.getConnectionStats()
+
+	// 更新每个设备的流量 - 只记录设备状态，流量显示全局值
+	for ip := range connections {
+		if !isLANIP(ip) {
 			continue
 		}
-		
 		dt, ok := m.devices[ip]
 		if !ok {
 			dt = &DeviceTraffic{IP: ip, Threshold: m.cfg.GlobalThreshold}
 			m.devices[ip] = dt
 		}
 
-		// 计算速率 (每个连接约1KB/秒估算)
-		interval := m.cfg.CollectInterval
-		if interval <= 0 {
-			interval = 5
+		// 设备流量 = 全局流量 / 设备数量（平均分配）
+		deviceCount := 0
+		for ip := range connections {
+			if isLANIP(ip) {
+				deviceCount++
+			}
 		}
-		
-		dt.RateIn = float64(data.BytesIn) / float64(interval) / 1024
-		dt.RateOut = float64(data.BytesOut) / float64(interval) / 1024
-		dt.BytesIn = data.BytesIn
-		dt.BytesOut = data.BytesOut
-		dt.TotalIn += int64(dt.RateIn * float64(interval) * 1024)
-		dt.TotalOut += int64(dt.RateOut * float64(interval) * 1024)
-		dt.LastUpdate = time.Now()
+		if deviceCount == 0 {
+			deviceCount = 1
+		}
 
-		// 阈值检查 (MB/小时)
+		// 平均分配全局流量
+		dt.RateIn = m.totalStats.RateIn / float64(deviceCount)
+		dt.RateOut = m.totalStats.RateOut / float64(deviceCount)
+		dt.TotalIn = m.totalStats.BytesIn / int64(deviceCount)
+		dt.TotalOut = m.totalStats.BytesOut / int64(deviceCount)
+		dt.BytesIn = int64(dt.RateIn * 1024)
+		dt.BytesOut = int64(dt.RateOut * 1024)
+		dt.LastUpdate = now
+
+		// 阈值检查
 		hourlyRate := (dt.RateIn + dt.RateOut) * 3600 / 1024
-		if int(hourlyRate) > dt.Threshold && dt.Threshold > 0 {
-			dt.AlertActive = true
-		} else {
-			dt.AlertActive = false
+		dt.AlertActive = int(hourlyRate) > dt.Threshold && dt.Threshold > 0
+	}
+
+	// 记录历史
+	if len(m.history) == 0 || now.Sub(m.history[len(m.history)-1].Timestamp) >= time.Minute {
+		m.history = append(m.history, HistoryPoint{
+			Timestamp: now,
+			RateIn:    m.totalStats.RateIn,
+			RateOut:   m.totalStats.RateOut,
+			TotalIn:   m.totalStats.BytesIn,
+			TotalOut:  m.totalStats.BytesOut,
+		})
+		if len(m.history) > 60 {
+			m.history = m.history[len(m.history)-60:]
 		}
 	}
+
+	log.Printf("流量统计: 全局入站=%.2f KB/s, 出站=%.2f KB/s, 累计=%d bytes", 
+		m.totalStats.RateIn, m.totalStats.RateOut, m.totalStats.BytesIn)
 }
 
-// 获取网络流量 (Windows)
-func (m *Monitor) getNetworkTraffic() map[string]NetworkStats {
-	result := make(map[string]NetworkStats)
-
+// getGlobalTraffic 获取全局网卡流量
+func (m *Monitor) getGlobalTraffic() NetworkStats {
 	if runtime.GOOS != "windows" {
-		return result
+		return NetworkStats{}
 	}
 
-	// 使用 netstat 获取连接统计
-	cmd := exec.Command("cmd", "/c", "netstat -ano")
+	// 使用 PowerShell 获取主网卡 (Ethernet0) 的流量
+	cmd := exec.Command("powershell", "-Command",
+		"$adapter = Get-NetAdapter | Where-Object {$_.Name -eq 'Ethernet0' -or $_.Name -eq '以太网' -or $_.Status -eq 'Up'} | Select-Object -First 1; "+
+		"$stats = Get-NetAdapterStatistics -Name $adapter.Name -ErrorAction SilentlyContinue; "+
+		"if($stats){$stats.ReceivedBytes; $stats.SentBytes}")
 	output, err := cmd.Output()
 	if err != nil {
-		log.Printf("流量获取失败: %v", err)
-		return result
+		log.Printf("获取流量失败: %v", err)
+		return NetworkStats{}
 	}
 
-	// 解析连接并按远程IP统计
-	lines := strings.Split(string(output), "\n")
-	connectionCount := make(map[string]int)
+	// 解析输出 (每行一个数字)
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	var totalReceived, totalSent int64
 	
-	for _, line := range lines {
-		if !strings.Contains(line, "ESTABLISHED") {
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		
+		val := strings.ReplaceAll(line, ",", "")
+		if v, err := strconv.ParseInt(val, 10, 64); err == nil {
+			if i == 0 {
+				totalReceived = v
+			} else if i == 1 {
+				totalSent = v
+				break
+			}
+		}
+	}
+
+	return NetworkStats{BytesIn: totalReceived, BytesOut: totalSent}
+}
+
+// getConnectionStats 获取连接统计
+func (m *Monitor) getConnectionStats() map[string]int {
+	connections := make(map[string]int)
+	if runtime.GOOS != "windows" {
+		return connections
+	}
+
+	cmd := exec.Command("cmd", "/c", "netstat -ano | findstr ESTABLISHED")
+	output, err := cmd.Output()
+	if err != nil {
+		return connections
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
 		fields := strings.Fields(line)
 		if len(fields) < 5 || fields[0] != "TCP" {
 			continue
 		}
-		
-		localAddr := fields[1]
-		remoteAddr := fields[2]
-		
-		localIP, _ := splitAddr(localAddr)
-		remoteIP, _ := splitAddr(remoteAddr)
-		
-		// 排除本地自连接
-		if localIP == remoteIP || remoteIP == "0.0.0.0" || remoteIP == ":::" {
-			continue
-		}
-		
-		connectionCount[remoteIP]++
-	}
 
-	// 为每个有连接的IP创建流量记录
-	for ip, count := range connectionCount {
-		result[ip] = NetworkStats{
-			BytesIn:  int64(count * 1024),  // 估算值
-			BytesOut: int64(count * 512),   // 估算值
+		localIP, _ := splitAddr(fields[1])
+		if localIP != "" && localIP != "127.0.0.1" && !strings.HasPrefix(localIP, "0.0.0.0") {
+			connections[localIP]++
 		}
 	}
 
-	// 计算总数
-	var totalIn, totalOut int64
-	for _, data := range result {
-		totalIn += data.BytesIn
-		totalOut += data.BytesOut
-	}
-	result["*"] = NetworkStats{
-		BytesIn:  totalIn,
-		BytesOut: totalOut,
-	}
-
-	log.Printf("流量统计: %d 个IP, 入站: %d, 出站: %d", len(result)-1, result["*"].BytesIn, result["*"].BytesOut)
-
-	return result
+	return connections
 }
 
-
-
-// ConnectionInfo 连接信息
-type ConnectionInfo struct {
-	LocalIP    string `json:"local_ip"`
-	RemoteIP   string `json:"remote_ip"`
-	LocalPort  int    `json:"local_port"`
-	RemotePort int    `json:"remote_port"`
-}
-
-// NetworkStats 网络统计
-type NetworkStats struct {
-	BytesIn  int64
-	BytesOut int64
-}
-
-// GetTraffic 获取设备流量
 func (m *Monitor) GetTraffic(ip string) *DeviceTraffic {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.devices[ip]
 }
 
-// GetAllTraffic 获取所有设备流量
 func (m *Monitor) GetAllTraffic() []*DeviceTraffic {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
 	result := make([]*DeviceTraffic, 0, len(m.devices))
 	for _, dt := range m.devices {
 		result = append(result, dt)
@@ -258,57 +306,72 @@ func (m *Monitor) GetAllTraffic() []*DeviceTraffic {
 	return result
 }
 
-// GetGlobalTraffic 获取全局流量
-func (m *Monitor) GetGlobalTraffic() (rateIn, rateOut float64, totalIn, totalOut int64) {
+func (m *Monitor) GetLANTraffic() []*DeviceTraffic {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	result := make([]*DeviceTraffic, 0)
 	for _, dt := range m.devices {
-		rateIn += dt.RateIn
-		rateOut += dt.RateOut
-		totalIn += dt.TotalIn
-		totalOut += dt.TotalOut
+		if !isLANIP(dt.IP) {
+			continue
+		}
+		result = append(result, dt)
 	}
+	return result
+}
+
+func (m *Monitor) GetGlobalTraffic() (rateIn, rateOut float64, totalIn, totalOut int64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rateIn = m.totalStats.RateIn
+	rateOut = m.totalStats.RateOut
+	totalIn = m.totalStats.BytesIn
+	totalOut = m.totalStats.BytesOut
 	return
 }
 
-// GetConnections 获取活跃连接
+func (m *Monitor) GetHistory() []HistoryPoint {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make([]HistoryPoint, len(m.history))
+	copy(result, m.history)
+	return result
+}
+
 func (m *Monitor) GetConnections() []ConnectionInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.connections
 }
 
-// SetThreshold 设置阈值
-func (m *Monitor) SetThreshold(ip string, threshold int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if dt, ok := m.devices[ip]; ok {
-		dt.Threshold = threshold
-	} else {
-		m.devices[ip] = &DeviceTraffic{IP: ip, Threshold: threshold}
+func isLANIP(ip string) bool {
+	if strings.HasPrefix(ip, "192.168.") {
+		return true
 	}
-}
-
-// CheckAlerts 检查需要告警的设备
-func (m *Monitor) CheckAlerts() []*models.TrafficAlert {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var alerts []*models.TrafficAlert
-	for _, dt := range m.devices {
-		if dt.AlertActive {
-			alerts = append(alerts, &models.TrafficAlert{
-				ID:          dt.IP + time.Now().Format("20060102150405"),
-				IP:          dt.IP,
-				Threshold:   dt.Threshold,
-				PeakRate:   dt.RateIn + dt.RateOut,
-				TotalTraffic: float64(dt.TotalIn + dt.TotalOut) / 1024 / 1024,
-				StartTime:   dt.LastUpdate,
-				Status:      "active",
-			})
+	if strings.HasPrefix(ip, "10.") {
+		return true
+	}
+	if strings.HasPrefix(ip, "172.") {
+		parts := strings.Split(ip, ".")
+		if len(parts) >= 2 {
+			num, _ := strconv.Atoi(parts[1])
+			if num >= 16 && num <= 31 {
+				return true
+			}
 		}
 	}
-	return alerts
+	return ip == "127.0.0.1" || ip == "localhost"
+}
+
+func splitAddr(addr string) (string, int) {
+	parts := strings.Split(addr, ":")
+	if len(parts) >= 2 {
+		port, _ := strconv.Atoi(parts[len(parts)-1])
+		return strings.Join(parts[:len(parts)-1], ":"), port
+	}
+	return addr, 0
+}
+
+func (m *Monitor) String() string {
+	return fmt.Sprintf("TrafficMonitor{devices:%d}", len(m.devices))
 }

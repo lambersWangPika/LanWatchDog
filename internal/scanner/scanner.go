@@ -46,6 +46,29 @@ func (s *Scanner) Stop() {
 	close(s.stopAutoScan)
 }
 
+// StartOnlineDurationUpdater 启动在线时长更新定时器
+func (s *Scanner) StartOnlineDurationUpdater() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.mu.RLock()
+				now := time.Now()
+				for _, d := range s.devices {
+					if d.Status == models.StatusOnline && !d.OnlineSince.IsZero() {
+						d.OnlineDuration = int64(now.Sub(d.OnlineSince).Seconds())
+					}
+				}
+				s.mu.RUnlock()
+			case <-s.stopAutoScan:
+				return
+			}
+		}
+	}()
+}
+
 // SetConfig 更新配置
 func (s *Scanner) SetConfig(cfg *config.Config) {
 	s.mu.Lock()
@@ -130,9 +153,18 @@ func (s *Scanner) Scan() ([]*models.Device, error) {
 	for ip, mac := range arpDevices {
 		if existing, ok := s.devices[ip]; ok {
 			// 已存在设备更新状态
+			// 如果是从离线变为在线，记录上线时间
+			if existing.Status != models.StatusOnline {
+				existing.OnlineSince = now
+			}
 			existing.Status = models.StatusOnline
 			existing.LastSeen = now
 			existing.WasOnline = true
+			if existing.OnlineSince.IsZero() {
+				existing.OnlineSince = now
+			}
+			// 计算在线时长
+			existing.OnlineDuration = int64(now.Sub(existing.OnlineSince).Seconds())
 			if mac != "" {
 				existing.MAC = mac
 				existing.Vendor = getVendor(mac)
@@ -141,16 +173,20 @@ func (s *Scanner) Scan() ([]*models.Device, error) {
 		} else {
 			// 新设备 - 每次都用当前时间
 			vendor := getVendor(mac)
+			now := time.Now()
 			device := &models.Device{
-				IP:         ip,
-				MAC:        mac,
-				Vendor:     vendor,
-				Status:     models.StatusOnline,
-				FirstSeen:  time.Now(),
-				LastSeen:   time.Now(),
-				WasOnline:  true,
-				Type:       s.identifyDeviceType(ip),
-				Name:       s.getDeviceName(ip),
+				IP:             ip,
+				MAC:            mac,
+				Vendor:         vendor,
+				Status:         models.StatusOnline,
+				FirstSeen:      now,
+				LastSeen:       now,
+				OnlineSince:    now,
+				OnlineDuration: 0,
+				WasOnline:      true,
+				Type:           s.identifyDeviceType(ip),
+				Name:           s.getDeviceName(ip),
+				Hostname:       s.getHostname(ip),
 			}
 			s.devices[ip] = device
 			devices = append(devices, device)
@@ -266,6 +302,46 @@ func (s *Scanner) getDeviceName(ipStr string) string {
 	return ""
 }
 
+// getHostname 获取 NetBIOS 主机名 (Windows)
+func (s *Scanner) getHostname(ipStr string) string {
+	// Windows: 使用 nbtstat -A 获取 NetBIOS 名称
+	cmd := exec.Command("nbtstat", "-A", ipStr)
+	output, err := cmd.Output()
+	if err == nil {
+		outputStr := string(output)
+		lines := strings.Split(outputStr, "\n")
+		for _, line := range lines {
+			// 查找 <00> 类型的 NetBIOS 名称 (工作站服务)
+			if strings.Contains(line, "<00>") && !strings.Contains(line, "GROUP") {
+				fields := strings.Fields(line)
+				for _, f := range fields {
+					f = strings.TrimSpace(f)
+					if f != "" && f != "<00>" && f != "UNIQUE" && !strings.Contains(f, "MAC") {
+						// 提取主机名 (去掉 <00> 标记)
+						hostname := strings.ReplaceAll(f, "<00>", "")
+						hostname = strings.ReplaceAll(hostname, "<", "")
+						hostname = strings.ReplaceAll(hostname, ">", "")
+						if len(hostname) > 0 && len(hostname) <= 15 {
+							return hostname
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// 备用: 尝试通过 DNS 反向解析
+	names, err := net.LookupAddr(ipStr)
+	if err == nil && len(names) > 0 {
+		hostname := strings.TrimSuffix(names[0], ".")
+		if hostname != "" && !strings.HasSuffix(hostname, ".local") {
+			return hostname
+		}
+	}
+	
+	return ""
+}
+
 // 识别设备类型
 func (s *Scanner) identifyDeviceType(ipStr string) models.DeviceType {
 	parts := net.ParseIP(ipStr).To4()
@@ -364,7 +440,7 @@ func (s *Scanner) GetDevice(ip string) *models.Device {
 }
 
 // UpdateDevice 更新设备信息
-func (s *Scanner) UpdateDevice(ip string, name string, group string, whitelist bool) error {
+func (s *Scanner) UpdateDevice(ip string, name string, group string, whitelist bool, notes string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	
@@ -372,6 +448,9 @@ func (s *Scanner) UpdateDevice(ip string, name string, group string, whitelist b
 		device.Name = name
 		device.Group = group
 		device.Whitelist = whitelist
+		if notes != "" {
+			device.Notes = notes
+		}
 		return nil
 	}
 	return fmt.Errorf("设备不存在: %s", ip)
@@ -394,7 +473,7 @@ func (s *Scanner) GetWhitelist() []*models.Device {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	
-	var result []*models.Device
+	result := []*models.Device{} // 初始化为空切片，避免返回null
 	for _, d := range s.devices {
 		if d.Whitelist {
 			result = append(result, d)
@@ -408,7 +487,7 @@ func (s *Scanner) GetBlacklist() []*models.Device {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	
-	var result []*models.Device
+	result := []*models.Device{} // 初始化为空切片，避免返回null
 	for _, d := range s.devices {
 		if d.Status == models.StatusBlocked {
 			result = append(result, d)
