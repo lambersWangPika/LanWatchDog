@@ -19,6 +19,8 @@ type Config struct {
 	TrafficInterval int  `json:"traffic_interval"` // 流量刷新间隔(秒)
 	GlobalThreshold int  `json:"global_threshold"` // 全局阈值(MB/小时)
 	ThresholdUnit   string `json:"threshold_unit"` // 阈值单位
+	UsePCAP         bool   `json:"use_pcap"`        // 使用PCAP精确流量
+	InterfaceName   string `json:"interface_name"` // 网卡名称
 
 	// 防御设置
 	DefenseEnabled     bool `json:"defense_enabled"`      // 是否启用防御

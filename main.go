@@ -80,6 +80,8 @@ func main() {
 		CollectInterval: cfg.TrafficInterval,
 		GlobalThreshold: cfg.GlobalThreshold,
 		ThresholdUnit:   cfg.ThresholdUnit,
+		UsePCAP:         cfg.UsePCAP,
+		InterfaceName:   cfg.InterfaceName,
 	})
 	if cfg.TrafficEnabled {
 		trafficMon.Start()
@@ -125,7 +127,7 @@ func main() {
 	http.Handle("/static/", http.FileServer(http.Dir(".")))
 
 	log.Println("========================================")
-	log.Println("  局域网设备监控系统 v1.3.0")
+	log.Println("  局域网设备监控系统 v1.3.1")
 	log.Println("  请访问: http://localhost:8080")
 	log.Println("========================================")
 
@@ -151,7 +153,7 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>局域网设备监控系统 v1.3.0</title>
+    <title>局域网设备监控系统 v1.3.1</title>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
@@ -227,7 +229,7 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
 <body onload="load()">
     <div class="header">
         <h1>🏠 局域网设备监控系统</h1>
-        <span>v1.3.0</span>
+        <span>v1.3.1</span>
     </div>
     <div class="toolbar">
         <button class="btn btn-primary" onclick="scan()" id="scanBtn">🔍 开始扫描</button>
@@ -248,9 +250,9 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
             <div class="stat-card"><div class="label">在线</div><div class="value" id="online" style="color:#52c41a">0</div></div>
             <div class="stat-card"><div class="label">离线</div><div class="value" id="offline" style="color:#ff4d4f">0</div></div>
             <div class="stat-card"><div class="label">白名单</div><div class="value" id="whitelistCount" style="color:#722ed1">0</div></div>
-            <div class="stat-card"><div class="label">流量速率</div><div class="value" id="trafficRate">0</div><div class="sub">KB/s</div></div>
-            <div class="stat-card"><div class="label">总入站</div><div class="value" id="homeTotalIn" style="color:#1890ff">0</div><div class="sub">KB</div></div>
-            <div class="stat-card"><div class="label">总出站</div><div class="value" id="homeTotalOut" style="color:#52c41a">0</div><div class="sub">KB</div></div>
+            <div class="stat-card"><div class="label">流量速率</div><div class="value" id="trafficRate">0</div></div>
+            <div class="stat-card"><div class="label">总入站</div><div class="value" id="homeTotalIn" style="color:#1890ff">0</div></div>
+            <div class="stat-card"><div class="label">总出站</div><div class="value" id="homeTotalOut" style="color:#52c41a">0</div></div>
             <div class="stat-card"><div class="label">告警</div><div class="value" id="alertCount2" style="color:#ff4d4f">0</div></div>
         </div>
         
@@ -284,10 +286,10 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
             </div>
             <div class="card-body">
                 <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
-                    <div class="stat-card"><div class="label">入站速率</div><div class="value" id="trafficIn">0</div><div class="sub">KB/s</div></div>
-                    <div class="stat-card"><div class="label">出站速率</div><div class="value" id="trafficOut">0</div><div class="sub">KB/s</div></div>
-                    <div class="stat-card"><div class="label">总入站</div><div class="value" id="trafficTotalIn">0</div><div class="sub">KB</div></div>
-                    <div class="stat-card"><div class="label">总出站</div><div class="value" id="trafficTotalOut">0</div><div class="sub">KB</div></div>
+                    <div class="stat-card"><div class="label">入站速率</div><div class="value" id="trafficIn">0</div></div>
+                    <div class="stat-card"><div class="label">出站速率</div><div class="value" id="trafficOut">0</div></div>
+                    <div class="stat-card"><div class="label">总入站</div><div class="value" id="trafficTotalIn">0</div></div>
+                    <div class="stat-card"><div class="label">总出站</div><div class="value" id="trafficTotalOut">0</div></div>
                 </div>
 
                 <!-- 流量图表 -->
@@ -388,6 +390,24 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
                     <h4>📊 流量监控阈值</h4>
                     <div class="form-group">
                         <label>全局流量阈值: <input type="number" id="globalThreshold" value="100" style="width:100px"> MB/小时</label>
+                    </div>
+                </div>
+                
+                <!-- PCAP 设置 -->
+                <div class="settings-section">
+                    <h4>🔍 PCAP 精确流量</h4>
+                    <div class="form-group">
+                        <label><input type="checkbox" id="usePCAP"> 启用 PCAP 捕获</label>
+                    </div>
+                    <div class="form-group">
+                        <label>网卡名称: <input type="text" id="interfaceName" style="width:200px" placeholder="留空自动选择"></label>
+                    </div>
+                    <div style="margin-top:12px;padding:10px;background:#fff7e6;border:1px solid #ffd591;border-radius:4px">
+                        <div style="color:#fa8c16;font-weight:500">⚠️ 首次使用需安装 npcap 驱动</div>
+                        <div style="margin-top:8px">
+                            下载: <a href="https://npcap.com/dist/npcap-1.78.exe" target="_blank" style="color:#1890ff">npcap-1.78.exe</a>
+                        </div>
+                        <div style="color:#999;font-size:12px;margin-top:4px">安装时勾选 "Npcap Loopback Adapter"</div>
                     </div>
                 </div>
                 
@@ -930,6 +950,9 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
                 document.getElementById('telegramChatID').value = c.telegram_chat_id || '';
                 document.getElementById('notifyWebhook').checked = c.notify_webhook === true;
                 document.getElementById('webhookURL').value = c.webhook_url || '';
+                // PCAP 设置
+                document.getElementById('usePCAP').checked = c.use_pcap === true;
+                document.getElementById('interfaceName').value = c.interface_name || '';
             });
         }
         
@@ -958,6 +981,9 @@ var pageTmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
                     telegram_chat_id: document.getElementById('telegramChatID').value,
                     notify_webhook: document.getElementById('notifyWebhook').checked,
                     webhook_url: document.getElementById('webhookURL').value,
+                    // PCAP 设置
+                    use_pcap: document.getElementById('usePCAP').checked,
+                    interface_name: document.getElementById('interfaceName').value,
                 };
                 fetch('/api/config',{
                     method:'POST',
@@ -1101,6 +1127,8 @@ func apiConfig(w http.ResponseWriter, r *http.Request) {
 			CollectInterval: cfg.TrafficInterval,
 			GlobalThreshold: cfg.GlobalThreshold,
 			ThresholdUnit:   cfg.ThresholdUnit,
+			UsePCAP:         cfg.UsePCAP,
+			InterfaceName:   cfg.InterfaceName,
 		})
 		alertMgr.SetConfig(&alerterPkg.Config{
 			Enabled:         cfg.AlertEnabled,

@@ -9,6 +9,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 )
 
 // Monitor 流量监控器
@@ -28,6 +32,18 @@ type Monitor struct {
 	// 监控开始后的累计流量
 	totalStats    NetworkStats
 	history       []HistoryPoint
+	
+	// PCAP 捕获
+	pcapHandle    *pcap.Handle
+	pcapEnabled   bool
+	pcapTraffic   map[string]*IPTraffic
+	pcapStopChan  chan struct{}
+}
+
+type IPTraffic struct {
+	BytesIn  int64
+	BytesOut int64
+	Packets  int64
 }
 
 type HistoryPoint struct {
@@ -44,6 +60,8 @@ type Config struct {
 	TrafficInterval int   `json:"traffic_interval"`
 	GlobalThreshold int   `json:"global_threshold"`
 	ThresholdUnit  string `json:"threshold_unit"`
+	UsePCAP         bool  `json:"use_pcap"`
+	InterfaceName   string `json:"interface_name"`
 }
 
 type DeviceTraffic struct {
@@ -75,10 +93,18 @@ type NetworkStats struct {
 
 func New(cfg *Config) *Monitor {
 	m := &Monitor{
-		cfg:      cfg,
-		devices:  make(map[string]*DeviceTraffic),
-		stopChan: make(chan struct{}),
+		cfg:         cfg,
+		devices:     make(map[string]*DeviceTraffic),
+		stopChan:    make(chan struct{}),
+		pcapTraffic: make(map[string]*IPTraffic),
+		pcapStopChan: make(chan struct{}),
 	}
+	
+	// 尝试初始化 PCAP
+	if cfg.UsePCAP {
+		m.initPCAP(cfg.InterfaceName)
+	}
+	
 	if cfg.Enabled {
 		go func() { m.collectLoop() }()
 	}
@@ -86,17 +112,181 @@ func New(cfg *Config) *Monitor {
 	return m
 }
 
+// initPCAP 初始化 PCAP 捕获
+func (m *Monitor) initPCAP(interfaceName string) bool {
+	if runtime.GOOS != "windows" {
+		log.Println("[PCAP] 仅支持 Windows 平台")
+		return false
+	}
+
+	// 如果没有指定网卡名，尝试自动获取
+	if interfaceName == "" {
+		iface, err := getDefaultInterface()
+		if err != nil {
+			log.Printf("[PCAP] 获取默认网卡失败: %v", err)
+			return false
+		}
+		interfaceName = iface
+	}
+
+	handle, err := pcap.OpenLive(interfaceName, 1600, true, pcap.BlockForever)
+	if err != nil {
+		log.Printf("[PCAP] 打开网卡 %s 失败: %v (需要安装 npcap 驱动)", interfaceName, err)
+		log.Printf("[PCAP] 请访问 https://npcap.com/dist/npcap-1.78.exe 下载安装")
+		return false
+	}
+
+	// 设置过滤器：只捕获 IP 包
+	filter := "ip and (tcp or udp)"
+	if err := handle.SetBPFFilter(filter); err != nil {
+		log.Printf("[PCAP] 设置过滤器失败: %v", err)
+		handle.Close()
+		return false
+	}
+
+	m.pcapHandle = handle
+	m.pcapEnabled = true
+	
+	// 启动 PCAP 捕获 goroutine
+	go m.pcapCaptureLoop()
+	
+	log.Printf("[PCAP] 已启动流量捕获: %s", interfaceName)
+	return true
+}
+
+// getDefaultInterface 获取默认网卡名称
+func getDefaultInterface() (string, error) {
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		return "", err
+	}
+	
+	// 优先找 Ethernet0 或以太网
+	for _, d := range devices {
+		if d.Name == "Ethernet0" || d.Name == "以太网" {
+			return d.Name, nil
+		}
+	}
+	
+	// 返回第一个非回环网卡
+	for _, d := range devices {
+		for _, a := range d.Addresses {
+			if !strings.HasPrefix(a.IP.String(), "127.") {
+				return d.Name, nil
+			}
+		}
+	}
+	
+	if len(devices) > 0 {
+		return devices[0].Name, nil
+	}
+	
+	return "", fmt.Errorf("未找到可用的网络接口")
+}
+
+// pcapCaptureLoop PCAP 捕获循环
+func (m *Monitor) pcapCaptureLoop() {
+	if m.pcapHandle == nil {
+		return
+	}
+
+	packetSource := gopacket.NewPacketSource(m.pcapHandle, m.pcapHandle.LinkType())
+	
+	for {
+		select {
+		case <-m.pcapStopChan:
+			return
+		case packet := <-packetSource.Packets():
+			if packet != nil {
+				m.processPacket(packet)
+			}
+		}
+	}
+}
+
+// processPacket 处理数据包
+func (m *Monitor) processPacket(packet gopacket.Packet) {
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	if ipLayer == nil {
+		return
+	}
+
+	ip, _ := ipLayer.(*layers.IPv4)
+	if ip == nil {
+		return
+	}
+
+	srcIP := ip.SrcIP.String()
+	dstIP := ip.DstIP.String()
+
+	// 只处理局域网 IP
+	if !isLANIP(srcIP) && !isLANIP(dstIP) {
+		return
+	}
+
+	payloadLen := int(ip.Length) - int(ip.IHL)*4
+	if payloadLen <= 0 {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 更新源 IP 的出站流量
+	if t, ok := m.pcapTraffic[srcIP]; ok {
+		t.BytesOut += int64(payloadLen)
+		t.Packets++
+	} else {
+		m.pcapTraffic[srcIP] = &IPTraffic{
+			BytesOut: int64(payloadLen),
+			Packets:  1,
+		}
+	}
+
+	// 更新目标 IP 的入站流量
+	if t, ok := m.pcapTraffic[dstIP]; ok {
+		t.BytesIn += int64(payloadLen)
+		t.Packets++
+	} else {
+		m.pcapTraffic[dstIP] = &IPTraffic{
+			BytesIn: int64(payloadLen),
+			Packets:  1,
+		}
+	}
+}
+
 func (m *Monitor) Start() {
 	if m.cfg.Enabled {
 		go m.collectLoop()
+	}
+	// 尝试启动 PCAP
+	if m.cfg.UsePCAP && !m.pcapEnabled {
+		m.initPCAP(m.cfg.InterfaceName)
 	}
 }
 
 func (m *Monitor) Stop() {
 	close(m.stopChan)
+	if m.pcapEnabled {
+		close(m.pcapStopChan)
+		if m.pcapHandle != nil {
+			m.pcapHandle.Close()
+		}
+	}
 }
 
 func (m *Monitor) SetConfig(cfg *Config) {
+	// 如果配置变化需要重启 PCAP
+	if cfg.UsePCAP != m.cfg.UsePCAP || cfg.InterfaceName != m.cfg.InterfaceName {
+		m.Stop()
+		m.pcapEnabled = false
+		m.pcapTraffic = make(map[string]*IPTraffic)
+		m.pcapStopChan = make(chan struct{})
+		
+		if cfg.UsePCAP {
+			m.initPCAP(cfg.InterfaceName)
+		}
+	}
 	m.cfg = cfg
 }
 
@@ -167,38 +357,60 @@ func (m *Monitor) collect() {
 	// 获取连接统计
 	connections := m.getConnectionStats()
 
-	// 更新每个设备的流量 - 只记录设备状态，流量显示全局值
-	for ip := range connections {
-		if !isLANIP(ip) {
-			continue
-		}
-		dt, ok := m.devices[ip]
-		if !ok {
-			dt = &DeviceTraffic{IP: ip, Threshold: m.cfg.GlobalThreshold}
-			m.devices[ip] = dt
-		}
-
-		// 设备流量 = 全局流量 / 设备数量（平均分配）
-		deviceCount := 0
-		for ip := range connections {
-			if isLANIP(ip) {
-				deviceCount++
+	// 如果启用了 PCAP，使用 PCAP 数据更新设备流量
+	if m.pcapEnabled {
+		for ip, pcapData := range m.pcapTraffic {
+			if !isLANIP(ip) {
+				continue
 			}
+			dt, ok := m.devices[ip]
+			if !ok {
+				dt = &DeviceTraffic{IP: ip, Threshold: m.cfg.GlobalThreshold}
+				m.devices[ip] = dt
+			}
+			dt.BytesIn = pcapData.BytesIn
+			dt.BytesOut = pcapData.BytesOut
+			// 速率需要根据时间间隔计算
+			dt.RateIn = float64(pcapData.BytesIn) / timeDiff / 1024
+			dt.RateOut = float64(pcapData.BytesOut) / timeDiff / 1024
+			dt.TotalIn = pcapData.BytesIn
+			dt.TotalOut = pcapData.BytesOut
+			dt.LastUpdate = now
 		}
-		if deviceCount == 0 {
-			deviceCount = 1
+	} else {
+		// 回退到旧逻辑：平均分配全局流量
+		for ip := range connections {
+			if !isLANIP(ip) {
+				continue
+			}
+			dt, ok := m.devices[ip]
+			if !ok {
+				dt = &DeviceTraffic{IP: ip, Threshold: m.cfg.GlobalThreshold}
+				m.devices[ip] = dt
+			}
+
+			deviceCount := 0
+			for ip := range connections {
+				if isLANIP(ip) {
+					deviceCount++
+				}
+			}
+			if deviceCount == 0 {
+				deviceCount = 1
+			}
+
+			dt.RateIn = m.totalStats.RateIn / float64(deviceCount)
+			dt.RateOut = m.totalStats.RateOut / float64(deviceCount)
+			dt.TotalIn = m.totalStats.BytesIn / int64(deviceCount)
+			dt.TotalOut = m.totalStats.BytesOut / int64(deviceCount)
+			dt.BytesIn = int64(dt.RateIn * 1024)
+			dt.BytesOut = int64(dt.RateOut * 1024)
+			dt.LastUpdate = now
 		}
+	}
 
-		// 平均分配全局流量
-		dt.RateIn = m.totalStats.RateIn / float64(deviceCount)
-		dt.RateOut = m.totalStats.RateOut / float64(deviceCount)
-		dt.TotalIn = m.totalStats.BytesIn / int64(deviceCount)
-		dt.TotalOut = m.totalStats.BytesOut / int64(deviceCount)
-		dt.BytesIn = int64(dt.RateIn * 1024)
-		dt.BytesOut = int64(dt.RateOut * 1024)
-		dt.LastUpdate = now
-
-		// 阈值检查
+	// 阈值检查
+	for _, dt := range m.devices {
 		hourlyRate := (dt.RateIn + dt.RateOut) * 3600 / 1024
 		dt.AlertActive = int(hourlyRate) > dt.Threshold && dt.Threshold > 0
 	}
@@ -217,8 +429,8 @@ func (m *Monitor) collect() {
 		}
 	}
 
-	log.Printf("流量统计: 全局入站=%.2f KB/s, 出站=%.2f KB/s, 累计=%d bytes", 
-		m.totalStats.RateIn, m.totalStats.RateOut, m.totalStats.BytesIn)
+	log.Printf("流量统计: 全局入站=%.2f KB/s, 出站=%.2f KB/s, 累计=%d bytes (PCAP=%v)", 
+		m.totalStats.RateIn, m.totalStats.RateOut, m.totalStats.BytesIn, m.pcapEnabled)
 }
 
 // getGlobalTraffic 获取全局网卡流量
@@ -344,6 +556,13 @@ func (m *Monitor) GetConnections() []ConnectionInfo {
 	return m.connections
 }
 
+// GetPCAPEnabled 获取 PCAP 是否启用
+func (m *Monitor) GetPCAPEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pcapEnabled
+}
+
 func isLANIP(ip string) bool {
 	if strings.HasPrefix(ip, "192.168.") {
 		return true
@@ -373,5 +592,5 @@ func splitAddr(addr string) (string, int) {
 }
 
 func (m *Monitor) String() string {
-	return fmt.Sprintf("TrafficMonitor{devices:%d}", len(m.devices))
+	return fmt.Sprintf("TrafficMonitor{devices:%d, pcap:%v}", len(m.devices), m.pcapEnabled)
 }

@@ -1,9 +1,7 @@
-package main
+package traffic
 
 import (
-	"fmt"
 	"log"
-	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -14,10 +12,10 @@ import (
 type PCAPCapture struct {
 	handle     *pcap.Handle
 	stopChan   chan struct{}
-	traffic    map[string]*IPTraffic
+	traffic    map[string]*PCAPTraffic
 }
 
-type IPTraffic struct {
+type PCAPTraffic struct {
 	BytesIn  int64
 	BytesOut int64
 	Packets  int64
@@ -26,7 +24,7 @@ type IPTraffic struct {
 // NewPCAPCapture 创建 pcap 捕获器
 func NewPCAPCapture(interfaceName string) *PCAPCapture {
 	c := &PCAPCapture{
-		traffic:  make(map[string]*IPTraffic),
+		traffic:  make(map[string]*PCAPTraffic),
 		stopChan: make(chan struct{}),
 	}
 
@@ -92,18 +90,18 @@ func (c *PCAPCapture) processPacket(packet gopacket.Packet) {
 	dstIP := ip.DstIP.String()
 
 	// 获取 payload 大小
-	payloadLen := int(ip.Length) - int(ip.HeaderLength)
+	payloadLen := int(ip.Length) - int(ip.IHL)*4
 
 	if payloadLen <= 0 {
 		return
 	}
 
 	// 更新流量统计
-	c.traffic[srcIP] = &IPTraffic{
+	c.traffic[srcIP] = &PCAPTraffic{
 		BytesOut: c.traffic[srcIP].BytesOut + int64(payloadLen),
 		Packets:  c.traffic[srcIP].Packets + 1,
 	}
-	c.traffic[dstIP] = &IPTraffic{
+	c.traffic[dstIP] = &PCAPTraffic{
 		BytesIn: c.traffic[dstIP].BytesIn + int64(payloadLen),
 		Packets:  c.traffic[dstIP].Packets + 1,
 	}

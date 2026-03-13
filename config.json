@@ -8,6 +8,8 @@
   "traffic_interval": 5,
   "global_threshold": 100,
   "threshold_unit": "MB",
+  "use_pcap": false,
+  "interface_name": "",
   "defense_enabled": true,
   "brute_force_detect": true,
   "port_scan_detect": true,
